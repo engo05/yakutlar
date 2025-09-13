@@ -2,6 +2,52 @@ import gradio as gr
 import ctranslate2
 from transformers import AutoTokenizer
 import json, os, re
+import platform
+import subprocess
+import multiprocessing
+
+# Apple Silicon auto device and threads configuration
+def _detect_apple_silicon_and_configure_threads():
+    """Detect Apple Silicon and set sensible thread defaults if not already configured."""
+    if platform.system() == "Darwin":  # macOS
+        try:
+            # Check for Apple Silicon (arm64 architecture)
+            arch_result = subprocess.run(["uname", "-m"], capture_output=True, text=True, check=True)
+            if "arm64" in arch_result.stdout.strip():
+                # Apple Silicon detected, determine performance core count
+                core_count = None
+                
+                # Try sysctl for performance cores first
+                try:
+                    result = subprocess.run(["sysctl", "-n", "hw.perflevel0.logicalcpu"], 
+                                          capture_output=True, text=True, check=True)
+                    core_count = int(result.stdout.strip())
+                except (subprocess.CalledProcessError, ValueError):
+                    # Fallback to total logical CPU count
+                    try:
+                        result = subprocess.run(["sysctl", "-n", "hw.ncpu"], 
+                                              capture_output=True, text=True, check=True)
+                        core_count = int(result.stdout.strip())
+                    except (subprocess.CalledProcessError, ValueError):
+                        # Final fallback to multiprocessing
+                        core_count = multiprocessing.cpu_count()
+                
+                # Set thread environment variables if not already set
+                if core_count and core_count > 0:
+                    if "CT2_NUM_THREADS" not in os.environ:
+                        os.environ["CT2_NUM_THREADS"] = str(core_count)
+                    if "OMP_NUM_THREADS" not in os.environ:
+                        os.environ["OMP_NUM_THREADS"] = str(core_count)
+        except Exception:
+            # Silently fail if detection doesn't work
+            pass
+
+# Configure Apple Silicon settings at module load
+_detect_apple_silicon_and_configure_threads()
+
+# Module-level defaults for CTranslate2 device and compute type
+CT2_DEVICE = os.environ.get("CT2_DEVICE", "auto")
+CT2_COMPUTE = os.environ.get("CT2_COMPUTE", "int8")
 
 # Models and tokenizers
 NLLB_MODEL_DIR = "models/nllb200-1.3b-ct2-int8"
@@ -203,7 +249,7 @@ def _load_marian(model_dir: str, tokenizer_dir: str):
     key = (model_dir, tokenizer_dir)
     if key not in _marian_cache:
         tok = AutoTokenizer.from_pretrained(tokenizer_dir)
-        tr = ctranslate2.Translator(model_dir, device="cpu", compute_type="int8")
+        tr = ctranslate2.Translator(model_dir, device=CT2_DEVICE, compute_type=CT2_COMPUTE)
         _marian_cache[key] = (tok, tr)
     return _marian_cache[key]
 
@@ -212,7 +258,7 @@ def _load_nllb(src_lang: str):
     key = src_lang
     if key not in _nllb_cache:
         tok = AutoTokenizer.from_pretrained(NLLB_HF_MODEL, src_lang=src_lang)
-        tr = ctranslate2.Translator(NLLB_MODEL_DIR, device="cpu", compute_type="int8")
+        tr = ctranslate2.Translator(NLLB_MODEL_DIR, device=CT2_DEVICE, compute_type=CT2_COMPUTE)
         _nllb_cache[key] = (tok, tr)
     return _nllb_cache[key]
 
@@ -220,7 +266,7 @@ def _load_nllb(src_lang: str):
 def _load_t5():
     if "obj" not in _t5_cache:
         tok = AutoTokenizer.from_pretrained(T5_TOKENIZER_DIR)
-        tr = ctranslate2.Translator(T5_MODEL_DIR, device="cpu", compute_type="int8")
+        tr = ctranslate2.Translator(T5_MODEL_DIR, device=CT2_DEVICE, compute_type=CT2_COMPUTE)
         _t5_cache["obj"] = (tok, tr)
     return _t5_cache["obj"]
 
@@ -304,7 +350,7 @@ def _marian_single_word_chuvash(src_text: str) -> str:
         tr = _marian_cache.get("tr")
         if tok is None or tr is None:
             tok = AutoTokenizer.from_pretrained("models/opus-en-trk")
-            tr = ctranslate2.Translator("models/opus-en-trk-ct2-int8", device="cpu", compute_type="int8")
+            tr = ctranslate2.Translator("models/opus-en-trk-ct2-int8", device=CT2_DEVICE, compute_type=CT2_COMPUTE)
             _marian_cache["tok"] = tok
             _marian_cache["tr"] = tr
         prep = ">>chv<< " + src_text
@@ -317,7 +363,7 @@ def _marian_single_word_chuvash(src_text: str) -> str:
         return ""
 
 
-def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ngram_size: int, repetition_penalty: float, length_penalty: float, dict_mode: bool, strip_ascii: bool, show_uyghur_nga: bool, topk: int, enable_sampling: bool, temperature: float, topp: float, pivot_ru: bool, pivot_ru_backend: str, rerank_mode: str, comet_model: str, marian_model_dir: str, marian_tokenizer_dir: str, roundtrip_backend: str, rt_marian_model_dir: str, rt_marian_tokenizer_dir: str, two_stage_pivot: bool, pivot_ru_nbest: int):
+def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ngram_size: int, repetition_penalty: float, length_penalty: float, dict_mode: bool, strip_ascii: bool, show_uyghur_nga: bool, topk: int, enable_sampling: bool, temperature: float, topp: float, pivot_ru: bool, pivot_ru_backend: str, rerank_mode: str, comet_model: str, marian_model_dir: str, marian_tokenizer_dir: str, roundtrip_backend: str, rt_marian_model_dir: str, rt_marian_tokenizer_dir: str, two_stage_pivot: bool, pivot_ru_nbest: int, allow_madlad_auto: bool):
     # Enforce Marian for Chuvash regardless of selected backend
     if (target or "").lower() == "chuvash":
         backend = "marian"
@@ -415,23 +461,74 @@ def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ng
                 out_text = ov[k][src_key]
                 return out_text, "", ""
 
-    # Backend auto-selection
+    # Backend selection with strict Auto routing
     use_t5 = False
+    auto_route_message = ""
+    
     if backend == "t5":
         use_t5 = True
     elif backend == "nllb":
         use_t5 = False
+    elif backend == "marian":
+        # Explicit Marian selection - will be handled later
+        pass  
     else:  # auto
-        # Hard default routing: prefer NLLB for its set; MADLAD for its set; otherwise T5 if a tag exists
-        if target_l in NLLB_DEFAULT:
+        # Strict Auto routing order: NLLB > Marian > MADLAD (with toggle)
+        target_l_lower = target_l.lower()
+        
+        # 1. Check if target is supported by NLLB
+        if target_l_lower in NLLB_TURKIC:
             use_t5 = False
-        elif target_l in MADLAD_DEFAULT:
-            use_t5 = True
         else:
-            use_t5 = target_l in T5_TURKIC
+            # 2. Check if Marian EN→MUL tag exists for target and model/tokenizer are configured
+            marian_available = False
+            if marian_model_dir and marian_tokenizer_dir:
+                # Check for supported Marian tags
+                tag_map = {
+                    "chuvash": ">>chv<<", "cv": ">>chv<<",
+                    "tyv": ">>tyv<<", "tuvinian": ">>tyv<<",
+                    "krc": ">>krc<<", "gag": ">>gag<<", "nog": ">>nog<<",
+                    "kaa": ">>kaa<<", "alt": ">>alt<<",
+                }
+                tag = tag_map.get(target_l_lower)
+                if tag:
+                    # Check if tag exists in tokenizer
+                    def _marian_enmul_has_tag(tag: str) -> bool:
+                        try:
+                            from transformers import AutoTokenizer
+                            tok = AutoTokenizer.from_pretrained(marian_tokenizer_dir)
+                            tid = tok.convert_tokens_to_ids([tag])[0]
+                            unk = getattr(tok, "unk_token_id", None)
+                            return (unk is None) or (tid != unk)
+                        except Exception:
+                            return False
+                    
+                    if _marian_enmul_has_tag(tag):
+                        marian_available = True
+            
+            if marian_available:
+                # Route to Marian (will set backend = "marian" later)
+                pass
+            else:
+                # 3. Check MADLAD/T5 with toggle
+                if target_l_lower in T5_TURKIC:
+                    if allow_madlad_auto:
+                        use_t5 = True
+                    else:
+                        # MADLAD blocked by toggle - return clear message
+                        auto_route_message = f"Auto mode: Target '{target}' requires MADLAD/T5 backend. Enable 'Allow MADLAD in Auto' toggle or select T5 backend explicitly."
+                        return auto_route_message, "", ""
+                else:
+                    # Target not supported by any backend
+                    auto_route_message = f"Auto mode: Target '{target}' is not supported by available backends."
+                    return auto_route_message, "", ""
 
-    # Optional early route to Marian for specific targets
-    if backend == "marian" or (backend == "auto" and target_l in {"chuvash"} and marian_model_dir and marian_tokenizer_dir):
+    # Route to Marian for explicit backend selection, Auto routing decision, or Chuvash hard force
+    marian_route = (backend == "marian" or 
+                   (backend == "auto" and target_l in {"chuvash"} and marian_model_dir and marian_tokenizer_dir) or
+                   (backend == "auto" and 'marian_available' in locals() and marian_available))
+    
+    if marian_route:
         # Marian EN->Target with language tag (e.g., >>chv<<). Pivot is ignored here (model expects EN source).
         tag_map = {
             "chuvash": ">>chv<<",
@@ -750,6 +847,8 @@ def build_ui():
                 with gr.Row():
                     rerank_mode = gr.Dropdown(choices=["auto", "none", "roundtrip", "cometqe"], value="auto", label="Rerank mode")
                     comet_model = gr.Textbox(value="Unbabel/wmt22-cometkiwi-da", label="COMET model", scale=2)
+                with gr.Row():
+                    allow_madlad_auto = gr.Checkbox(value=False, label="Allow MADLAD in Auto", info="Enables MADLAD/T5 as fallback in Auto mode when NLLB/Marian unavailable")
                 with gr.Accordion("Marian settings (optional)", open=False):
                     with gr.Row():
                         marian_model_dir = gr.Textbox(value="models/opus-mt-en-mul-ct2-int8", label="Marian CT2 model dir", scale=2)
@@ -766,7 +865,7 @@ def build_ui():
                         pivot_ru_nbest = gr.Slider(1, 10, value=5, step=1, label="Pivot RU N-best")
                 btn.click(
                     fn=translate,
-                    inputs=[inp, target, backend, beam, no_repeat, rep_pen, len_pen, dict_mode, strip_ascii, show_uyg, topk, enable_sampling, temperature, topp, pivot_ru, pivot_ru_backend, rerank_mode, comet_model, marian_model_dir, marian_tokenizer_dir, roundtrip_backend, rt_marian_model_dir, rt_marian_tokenizer_dir, two_stage_pivot, pivot_ru_nbest],
+                    inputs=[inp, target, backend, beam, no_repeat, rep_pen, len_pen, dict_mode, strip_ascii, show_uyg, topk, enable_sampling, temperature, topp, pivot_ru, pivot_ru_backend, rerank_mode, comet_model, marian_model_dir, marian_tokenizer_dir, roundtrip_backend, rt_marian_model_dir, rt_marian_tokenizer_dir, two_stage_pivot, pivot_ru_nbest, allow_madlad_auto],
                     outputs=[out, out_ng, alts_box],
                 )
                 def _defaults(t):
