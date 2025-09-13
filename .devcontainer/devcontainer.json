@@ -1,0 +1,40 @@
+{
+    "name": "Yakutlar Turkic Translation App",
+    "image": "mcr.microsoft.com/devcontainers/python:3.10",
+    
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": true,
+            "configureZshAsDefaultShell": true,
+            "installOhMyZsh": true
+        },
+        "ghcr.io/devcontainers/features/git:1": {},
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    },
+    
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.pylint"
+            ]
+        }
+    },
+    
+    "forwardPorts": [7860],
+    
+    "portsAttributes": {
+        "7860": {
+            "label": "Yakutlar App",
+            "onAutoForward": "notify"
+        }
+    },
+    
+    "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt && chmod +x .devcontainer/start.sh",
+    
+    "postStartCommand": "bash .devcontainer/start.sh",
+    
+    "remoteEnv": {
+        "GRADIO_SERVER_NAME": "0.0.0.0"
+    }
+}
