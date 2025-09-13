@@ -102,6 +102,101 @@ _nllb_cache = {}
 _t5_cache = {}
 _marian_cache = {}
 _marian_enmul_supported = None
+_comet_cache = {}  # Cache COMET models to avoid reloading
+
+
+def _char_f1(a: str, b: str) -> float:
+    """Compute character-level F1 score between two strings."""
+    if not a or not b:
+        return 0.0
+    import collections
+    ca, cb = collections.Counter(a), collections.Counter(b)
+    inter = sum((ca & cb).values())
+    p = inter / max(1, len(b))
+    r = inter / max(1, len(a))
+    return (2 * p * r / (p + r)) if (p > 0 and r > 0) else 0.0
+
+
+def _get_comet_model(model_id_or_path: str):
+    """Get COMET model from cache or load it."""
+    if model_id_or_path in _comet_cache:
+        return _comet_cache[model_id_or_path]
+    
+    try:
+        import os
+        from comet import download_model, load_from_checkpoint
+        
+        # Prefer local path if it exists
+        if os.path.exists(model_id_or_path):
+            mpath = model_id_or_path
+        else:
+            mpath = download_model(model_id_or_path)
+        
+        comet_model = load_from_checkpoint(mpath)
+        _comet_cache[model_id_or_path] = comet_model
+        return comet_model
+    except Exception as e:
+        print(f"[UI] Failed to load COMET model {model_id_or_path}: {e}", flush=True)
+        return None
+
+
+def _comet_predict_scores(comet_model, src_text: str, hyps: list):
+    """Predict COMET scores for a list of hypotheses."""
+    if not comet_model or not hyps:
+        return None
+    
+    try:
+        import torch
+        gpus = 1 if torch.cuda.is_available() else 0
+        data = [{"src": src_text, "mt": h} for h in hyps]
+        ret = comet_model.predict(data, batch_size=8, gpus=gpus, num_workers=1)
+        scores = ret.get("scores") if isinstance(ret, dict) else getattr(ret, "scores", None)
+        return scores
+    except Exception as e:
+        print(f"[UI] COMET prediction failed: {e}", flush=True)
+        return None
+
+
+def _compute_roundtrip_charf1(text: str, hyps: list, roundtrip_backend: str, rt_marian_model_dir: str, rt_marian_tokenizer_dir: str):
+    """Compute roundtrip CharF1 scores for a list of hypotheses."""
+    if not hyps:
+        return []
+    
+    scored = []
+    
+    if roundtrip_backend == "marian_big" and rt_marian_model_dir and rt_marian_tokenizer_dir:
+        try:
+            tok_b, tr_b = _load_marian(rt_marian_model_dir, rt_marian_tokenizer_dir)
+            for h in hyps:
+                ids_b = tok_b.encode(h)
+                toks_b = tok_b.convert_ids_to_tokens(ids_b)
+                res_b = tr_b.translate_batch([toks_b], beam_size=8)
+                back = tok_b.decode(tok_b.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
+                scored.append((_char_f1(text, back), h))
+        except Exception as e:
+            print(f"[UI] Marian roundtrip failed: {e}", flush=True)
+            return [(0.0, h) for h in hyps]
+    else:
+        # Use T5 for roundtrip
+        try:
+            tok_t5, tr_t5 = _load_t5()
+            en_tag = "<2en>"
+            for h in hyps:
+                try:
+                    _ = tok_t5.convert_tokens_to_ids([en_tag])[0]
+                    pre = f"{en_tag} {h}"
+                except Exception:
+                    pre = f"Translate to English: {h}"
+                ids_b = tok_t5.encode(pre)
+                toks_b = tok_t5.convert_ids_to_tokens(ids_b)
+                res_b = tr_t5.translate_batch([toks_b], beam_size=8)
+                back = tok_t5.decode(tok_t5.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
+                scored.append((_char_f1(text, back), h))
+        except Exception as e:
+            print(f"[UI] T5 roundtrip failed: {e}", flush=True)
+            return [(0.0, h) for h in hyps]
+    
+    return scored
 
 
 def _load_marian(model_dir: str, tokenizer_dir: str):
@@ -223,22 +318,30 @@ def _marian_single_word_chuvash(src_text: str) -> str:
 
 
 def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ngram_size: int, repetition_penalty: float, length_penalty: float, dict_mode: bool, strip_ascii: bool, show_uyghur_nga: bool, topk: int, enable_sampling: bool, temperature: float, topp: float, pivot_ru: bool, pivot_ru_backend: str, rerank_mode: str, comet_model: str, marian_model_dir: str, marian_tokenizer_dir: str, roundtrip_backend: str, rt_marian_model_dir: str, rt_marian_tokenizer_dir: str, two_stage_pivot: bool, pivot_ru_nbest: int):
-    # Default rerank mode: prefer COMET-QE if not specified
-    if not rerank_mode or rerank_mode.lower() == "auto":
-        rerank_mode = "cometqe"
     # Enforce Marian for Chuvash regardless of selected backend
     if (target or "").lower() == "chuvash":
         backend = "marian"
 
     # Dynamic routing: prefer Marian en->mul for targets with supported tags
     def _marian_enmul_has_tag(tag: str) -> bool:
+        # Prefer local tokenizer dir when available (robustness improvement)
+        tokenizer_path = marian_tokenizer_dir if marian_tokenizer_dir else "Helsinki-NLP/opus-mt-en-mul"
         from transformers import AutoTokenizer
         try:
-            tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-mul")
+            tok = AutoTokenizer.from_pretrained(tokenizer_path)
             tid = tok.convert_tokens_to_ids([tag])[0]
             unk = getattr(tok, "unk_token_id", None)
             return (unk is None) or (tid != unk)
         except Exception:
+            # Fallback to online if local fails
+            if tokenizer_path != "Helsinki-NLP/opus-mt-en-mul":
+                try:
+                    tok = AutoTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-mul")
+                    tid = tok.convert_tokens_to_ids([tag])[0]
+                    unk = getattr(tok, "unk_token_id", None)
+                    return (unk is None) or (tid != unk)
+                except Exception:
+                    pass
             return False
 
     tgt_l = (target or "").lower()
@@ -258,9 +361,33 @@ def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ng
         backend = "marian"
     text = (text or "").strip()
     if not text:
-        return "", ""
+        return "", "", ""  # Fix: return 3 values to match UI outputs
 
     target_l = target.lower()
+
+    # Auto rerank logic: resolve "auto" mode based on input characteristics
+    _rr_mode = rerank_mode
+    if not rerank_mode or rerank_mode.lower() == "auto":
+        try:
+            short_input = len((text or "").split()) <= 2
+            token_count = len((text or "").split())
+            text_len = len(text or "")
+        except Exception:
+            short_input = True
+            token_count = 0
+            text_len = 0
+        
+        if short_input:
+            # Very short input: do not rerank, prefer dictionary/override logic
+            _rr_mode = "none"
+        elif token_count >= 5 or text_len >= 20:
+            # Longer input: try COMET-QE first, fallback to roundtrip
+            comet_model_name = comet_model or "Unbabel/wmt22-cometkiwi-da"
+            comet = _get_comet_model(comet_model_name)
+            _rr_mode = "cometqe" if comet else "roundtrip"
+        else:
+            # Medium input: fallback to roundtrip
+            _rr_mode = "roundtrip"
 
     # For very short inputs to Chuvash, raise beam and disable sampling
     try:
@@ -332,98 +459,18 @@ def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ng
         )
         res = tr_m.translate_batch([toks], **translate_kwargs)
         hyps = [tok_m.decode(tok_m.convert_tokens_to_ids(h), skip_special_tokens=True) for h in res[0].hypotheses[:max(1,int(topk))]]
-        # Rerank if configured (roundtrip via T5, or COMET)
-        if rerank_mode == "roundtrip" and len(hyps) > 1:
-            # Backtranslate using T5 into English
-            def _char_f1(a: str, b: str) -> float:
-                if not a or not b:
-                    return 0.0
-                import collections
-                ca, cb = collections.Counter(a), collections.Counter(b)
-                inter = sum((ca & cb).values())
-                p = inter / max(1, len(b)); r = inter / max(1, len(a))
-                return (2*p*r/(p+r)) if (p>0 and r>0) else 0.0
-            tok_t5, tr_t5 = _load_t5()
-            scored = []
-            en_tag = "<2en>"
-            for h in hyps:
-                try:
-                    _ = tok_t5.convert_tokens_to_ids([en_tag])[0]
-                    pre = f"{en_tag} {h}"
-                except Exception:
-                    pre = f"Translate to English: {h}"
-                ids_b = tok_t5.encode(pre)
-                toks_b = tok_t5.convert_ids_to_tokens(ids_b)
-                res_b = tr_t5.translate_batch([toks_b], beam_size=max(8, beam_size//2))
-                back = tok_t5.decode(tok_t5.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
-                scored.append((_char_f1(text, back), h))
+        # Rerank if configured using unified Auto logic
+        if _rr_mode == "roundtrip" and len(hyps) > 1:
+            scored = _compute_roundtrip_charf1(text, hyps, roundtrip_backend, rt_marian_model_dir, rt_marian_tokenizer_dir)
             scored.sort(key=lambda x: x[0], reverse=True)
             hyps = [h for _, h in scored]
-        elif rerank_mode == "cometqe" and len(hyps) > 1:
-            try:
-                import os
-                from comet import download_model, load_from_checkpoint
-                cm = comet_model or "Unbabel/wmt22-cometkiwi-da"
-                mpath = cm if (cm and os.path.exists(cm)) else download_model(cm)
-                _cm = load_from_checkpoint(mpath)
-                data = [{"src": text, "mt": h} for h in hyps]
-                ret = _cm.predict(data, batch_size=8, gpus=0, num_workers=1)
-                scores = ret.get("scores") if isinstance(ret, dict) else getattr(ret, "scores", None)
-                # Optional hybrid: blend COMET with roundtrip char-F1 for short inputs
-                comb_scores = None
-                try:
-                    short_input = len((text or "").split()) <= 2
-                except Exception:
-                    short_input = False
-                if scores and short_input:
-                    # compute roundtrip char-F1 via T5 by default
-                    def _char_f1(a: str, b: str) -> float:
-                        if not a or not b:
-                            return 0.0
-                        import collections
-                        ca, cb = collections.Counter(a), collections.Counter(b)
-                        inter = sum((ca & cb).values())
-                        p = inter / max(1, len(b)); r = inter / max(1, len(a))
-                        return (2*p*r/(p+r)) if (p>0 and r>0) else 0.0
-                    rt_scores = []
-                    if roundtrip_backend == "marian_big" and rt_marian_model_dir and rt_marian_tokenizer_dir:
-                        tok_b, tr_b = _load_marian(rt_marian_model_dir, rt_marian_tokenizer_dir)
-                        for h in hyps:
-                            ids_b = tok_b.encode(h)
-                            toks_b = tok_b.convert_ids_to_tokens(ids_b)
-                            res_b = tr_b.translate_batch([toks_b], beam_size=max(8, beam_size//2))
-                            back = tok_b.decode(tok_b.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
-                            rt_scores.append(_char_f1(text, back))
-                    else:
-                        tok_t5, tr_t5 = _load_t5()
-                        en_tag = "<2en>"
-                        for h in hyps:
-                            try:
-                                _ = tok_t5.convert_tokens_to_ids([en_tag])[0]
-                                pre = f"{en_tag} {h}"
-                            except Exception:
-                                pre = f"Translate to English: {h}"
-                            ids_b = tok_t5.encode(pre)
-                            toks_b = tok_t5.convert_ids_to_tokens(ids_b)
-                            res_b = tr_t5.translate_batch([toks_b], beam_size=max(8, beam_size//2))
-                            back = tok_t5.decode(tok_t5.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
-                            rt_scores.append(_char_f1(text, back))
-                    # normalize to [0,1]
-                    import math
-                    def _norm(xs):
-                        if not xs:
-                            return xs
-                        mn, mx = min(xs), max(xs)
-                        return [0.5]*len(xs) if math.isclose(mx, mn) else [(x-mn)/(mx-mn) for x in xs]
-                    s1 = _norm(scores)
-                    s2 = _norm(rt_scores)
-                    alpha = 0.7
-                    comb_scores = [alpha*s1[i] + (1-alpha)*s2[i] for i in range(len(hyps))]
-                base = comb_scores if comb_scores else scores
-                order = sorted(range(len(hyps)), key=lambda j: (base[j], -len(hyps[j])), reverse=True) if base else list(range(len(hyps)))
-                hyps = [hyps[j] for j in order]
-            except Exception as e:
-                print(f"[UI] COMET rerank disabled: {e}", flush=True)
+        elif _rr_mode == "cometqe" and len(hyps) > 1:
+            cm = _get_comet_model(comet_model or "Unbabel/wmt22-cometkiwi-da")
+            if cm:
+                scores = _comet_predict_scores(cm, text, hyps)
+                if scores:
+                    order = sorted(range(len(hyps)), key=lambda j: scores[j], reverse=True)
+                    hyps = [hyps[j] for j in order]
         # Script conformity tie-breaker for Cyrillic-heavy targets
         hyps = _prefer_cyrillic_hyps(hyps, target_l)
         out_text = hyps[0]
@@ -472,55 +519,19 @@ def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ng
                         hyps2 = [h for h in hyps if not _looks_russian(h)]
                         if hyps2:
                             hyps = hyps2
-                    # Rerank by selected mode
-                    if rerank_mode == "cometqe" and len(hyps) > 1:
-                        try:
-                            import os
-                            from comet import download_model, load_from_checkpoint
-                            cm = comet_model or "Unbabel/wmt22-cometkiwi-da"
-                            mpath = cm if (cm and os.path.exists(cm)) else download_model(cm)
-                            _cm = load_from_checkpoint(mpath)
-                            data = [{"src": text, "mt": h} for h in hyps]
-                            ret = _cm.predict(data, batch_size=8, gpus=0, num_workers=1)
-                            scores = ret.get("scores") if isinstance(ret, dict) else getattr(ret, "scores", None)
-                            order = sorted(range(len(hyps)), key=lambda j: scores[j], reverse=True) if scores else list(range(len(hyps)))
-                            hyps = [hyps[j] for j in order]
-                        except Exception as e:
-                            print(f"[UI] COMET rerank disabled: {e}", flush=True)
-                    elif rerank_mode == "roundtrip" and len(hyps) > 1:
-                        def _char_f1(a: str, b: str) -> float:
-                            if not a or not b:
-                                return 0.0
-                            import collections
-                            ca, cb = collections.Counter(a), collections.Counter(b)
-                            inter = sum((ca & cb).values())
-                            p = inter / max(1, len(b)); r = inter / max(1, len(a))
-                            return (2*p*r/(p+r)) if (p>0 and r>0) else 0.0
-                        if roundtrip_backend == "marian_big":
-                            tok_b, tr_b = _load_marian(rt_marian_model_dir, rt_marian_tokenizer_dir)
-                            scored = []
-                            for h in hyps:
-                                ids_b = tok_b.encode(h)
-                                toks_b = tok_b.convert_ids_to_tokens(ids_b)
-                                res_b = tr_b.translate_batch([toks_b], beam_size=max(8, beam_size//2))
-                                back = tok_b.decode(tok_b.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
-                                scored.append((_char_f1(text, back), h))
-                            hyps = [max(scored, key=lambda x: x[0])[1]] + [h for _, h in sorted(scored, key=lambda x: x[0], reverse=True)][1:]
-                        else:
-                            en_tag = "<2en>"
-                            scored = []
-                            for h in hyps:
-                                try:
-                                    _ = tok.convert_tokens_to_ids([en_tag])[0]
-                                    pre = f"{en_tag} {h}"
-                                except Exception:
-                                    pre = f"Translate to English: {h}"
-                                ids_b = tok.encode(pre)
-                                toks_b = tok.convert_ids_to_tokens(ids_b)
-                                res_b = tr.translate_batch([toks_b], beam_size=max(8, beam_size//2))
-                                back = tok.decode(tok.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
-                                scored.append((_char_f1(text, back), h))
-                            hyps = [max(scored, key=lambda x: x[0])[1]] + [h for _, h in sorted(scored, key=lambda x: x[0], reverse=True)][1:]
+                    # Rerank by selected mode using unified Auto logic
+                    if _rr_mode == "cometqe" and len(hyps) > 1:
+                        cm = _get_comet_model(comet_model or "Unbabel/wmt22-cometkiwi-da")
+                        if cm:
+                            scores = _comet_predict_scores(cm, text, hyps)
+                            if scores:
+                                order = sorted(range(len(hyps)), key=lambda j: scores[j], reverse=True)
+                                hyps = [hyps[j] for j in order]
+                    elif _rr_mode == "roundtrip" and len(hyps) > 1:
+                        scored = _compute_roundtrip_charf1(text, hyps, roundtrip_backend, rt_marian_model_dir, rt_marian_tokenizer_dir)
+                        if scored:
+                            scored.sort(key=lambda x: x[0], reverse=True)
+                            hyps = [h for _, h in scored]
                     out_text = hyps[0]
                     alts = [f"{i+2}) {h}" for i, h in enumerate(hyps[1:])]
                     return out_text, "", "\n".join(alts)
@@ -561,55 +572,18 @@ def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ng
         res = tr.translate_batch([toks], **translate_kwargs)
         # Sammle Hypothesen (Top-k)
         hyps = [tok.decode(tok.convert_tokens_to_ids(h), skip_special_tokens=True) for h in res[0].hypotheses[:max(1,int(topk))]]
-        # Reranking: roundtrip or COMET-QE
-        if rerank_mode == "roundtrip" and len(hyps) > 1:
-            # Backtranslate each hyp to English (T5 or Marian mul->en big) and score by char-F1
-            def _char_f1(a: str, b: str) -> float:
-                if not a or not b:
-                    return 0.0
-                import collections
-                ca, cb = collections.Counter(a), collections.Counter(b)
-                inter = sum((ca & cb).values())
-                p = inter / max(1, len(b)); r = inter / max(1, len(a))
-                return (2*p*r/(p+r)) if (p>0 and r>0) else 0.0
-            scored = []
-            en_tag = "<2en>"
-            if roundtrip_backend == "marian_big":
-                tok_b, tr_b = _load_marian(rt_marian_model_dir, rt_marian_tokenizer_dir)
-                for h in hyps:
-                    ids_b = tok_b.encode(h)
-                    toks_b = tok_b.convert_ids_to_tokens(ids_b)
-                    res_b = tr_b.translate_batch([toks_b], beam_size=max(8, beam_size//2))
-                    back = tok_b.decode(tok_b.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
-                    scored.append((_char_f1(text, back), h))
-            else:
-                for h in hyps:
-                    try:
-                        _ = tok.convert_tokens_to_ids([en_tag])[0]
-                        pre = f"{en_tag} {h}"
-                    except Exception:
-                        pre = f"Translate to English: {h}"
-                    ids_b = tok.encode(pre)
-                    toks_b = tok.convert_ids_to_tokens(ids_b)
-                    res_b = tr.translate_batch([toks_b], beam_size=max(8, beam_size//2))
-                    back = tok.decode(tok.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
-                    scored.append((_char_f1(text, back), h))
+        # Reranking using unified Auto logic
+        if _rr_mode == "roundtrip" and len(hyps) > 1:
+            scored = _compute_roundtrip_charf1(text, hyps, roundtrip_backend, rt_marian_model_dir, rt_marian_tokenizer_dir)
             scored.sort(key=lambda x: x[0], reverse=True)
             hyps = [h for _, h in scored]
-        elif rerank_mode == "cometqe" and len(hyps) > 1:
-            try:
-                import os
-                from comet import download_model, load_from_checkpoint
-                cm = comet_model or "Unbabel/wmt22-cometkiwi-da"
-                mpath = cm if (cm and os.path.exists(cm)) else download_model(cm)
-                _cm = load_from_checkpoint(mpath)
-                data = [{"src": text, "mt": h} for h in hyps]
-                ret = _cm.predict(data, batch_size=8, gpus=0, num_workers=1)
-                scores = ret.get("scores") if isinstance(ret, dict) else getattr(ret, "scores", None)
-                order = sorted(range(len(hyps)), key=lambda j: scores[j], reverse=True) if scores else list(range(len(hyps)))
-                hyps = [hyps[j] for j in order]
-            except Exception as e:
-                print(f"[UI] COMET rerank disabled: {e}", flush=True)
+        elif _rr_mode == "cometqe" and len(hyps) > 1:
+            cm = _get_comet_model(comet_model or "Unbabel/wmt22-cometkiwi-da")
+            if cm:
+                scores = _comet_predict_scores(cm, text, hyps)
+                if scores:
+                    order = sorted(range(len(hyps)), key=lambda j: scores[j], reverse=True)
+                    hyps = [hyps[j] for j in order]
         # Script conformity tie-breaker for Cyrillic-heavy targets
         hyps = _prefer_cyrillic_hyps(hyps, target_l)
         out_text = hyps[0]
@@ -656,45 +630,18 @@ def translate(text: str, target: str, backend: str, beam_size: int, no_repeat_ng
             if tok_seq and tok_seq[0] == tgt_lang:
                 tok_seq = tok_seq[1:]
             hyps.append(tok.decode(tok.convert_tokens_to_ids(tok_seq), skip_special_tokens=True))
-        # Reranking: roundtrip or COMET-QE
-        if rerank_mode == "roundtrip" and len(hyps) > 1:
-            def _char_f1(a: str, b: str) -> float:
-                if not a or not b:
-                    return 0.0
-                import collections
-                ca, cb = collections.Counter(a), collections.Counter(b)
-                inter = sum((ca & cb).values())
-                p = inter / max(1, len(b)); r = inter / max(1, len(a))
-                return (2*p*r/(p+r)) if (p>0 and r>0) else 0.0
-            scored = []
-            en_tag = "<2en>"
-            for h in hyps:
-                try:
-                    _ = tok.convert_tokens_to_ids([en_tag])[0]
-                    pre = f"{en_tag} {h}"
-                except Exception:
-                    pre = f"Translate to English: {h}"
-                ids_b = tok.encode(pre)
-                toks_b = tok.convert_ids_to_tokens(ids_b)
-                res_b = tr.translate_batch([toks_b], beam_size=max(8, beam_size//2))
-                back = tok.decode(tok.convert_tokens_to_ids(res_b[0].hypotheses[0]), skip_special_tokens=True)
-                scored.append((_char_f1(text, back), h))
+        # Reranking using unified Auto logic
+        if _rr_mode == "roundtrip" and len(hyps) > 1:
+            scored = _compute_roundtrip_charf1(text, hyps, roundtrip_backend, rt_marian_model_dir, rt_marian_tokenizer_dir)
             scored.sort(key=lambda x: x[0], reverse=True)
             hyps = [h for _, h in scored]
-        elif rerank_mode == "cometqe" and len(hyps) > 1:
-            try:
-                import os
-                from comet import download_model, load_from_checkpoint
-                cm = comet_model or "Unbabel/wmt22-cometkiwi-da"
-                mpath = cm if (cm and os.path.exists(cm)) else download_model(cm)
-                _cm = load_from_checkpoint(mpath)
-                data = [{"src": text, "mt": h} for h in hyps]
-                ret = _cm.predict(data, batch_size=8, gpus=0, num_workers=1)
-                scores = ret.get("scores") if isinstance(ret, dict) else getattr(ret, "scores", None)
-                order = sorted(range(len(hyps)), key=lambda j: scores[j], reverse=True) if scores else list(range(len(hyps)))
-                hyps = [hyps[j] for j in order]
-            except Exception as e:
-                print(f"[UI] COMET rerank disabled: {e}")
+        elif _rr_mode == "cometqe" and len(hyps) > 1:
+            cm = _get_comet_model(comet_model or "Unbabel/wmt22-cometkiwi-da")
+            if cm:
+                scores = _comet_predict_scores(cm, text, hyps)
+                if scores:
+                    order = sorted(range(len(hyps)), key=lambda j: scores[j], reverse=True)
+                    hyps = [hyps[j] for j in order]
         # Script conformity tie-breaker for Cyrillic-heavy targets
         hyps = _prefer_cyrillic_hyps(hyps, target_l)
         out_text = hyps[0]
@@ -801,7 +748,7 @@ def build_ui():
                     pivot_ru = gr.Checkbox(value=False, label="Use Russian pivot")
                     pivot_ru_backend = gr.Dropdown(choices=["nllb", "t5"], value="nllb", label="Pivot RU backend")
                 with gr.Row():
-                    rerank_mode = gr.Dropdown(choices=["none", "roundtrip", "cometqe"], value="none", label="Rerank mode")
+                    rerank_mode = gr.Dropdown(choices=["auto", "none", "roundtrip", "cometqe"], value="auto", label="Rerank mode")
                     comet_model = gr.Textbox(value="Unbabel/wmt22-cometkiwi-da", label="COMET model", scale=2)
                 with gr.Accordion("Marian settings (optional)", open=False):
                     with gr.Row():
@@ -834,11 +781,11 @@ def build_ui():
                     # Defaults
                     beam_v, topk_v, rr_mode, piv_on, piv_backend = 12, 1, "none", False, "nllb"
                     if tl in {"chuvash", "cv"}:
-                        beam_v, topk_v, rr_mode, piv_on, piv_backend = 24, 5, "cometqe", False, "nllb"
+                        beam_v, topk_v, rr_mode, piv_on, piv_backend = 24, 5, "auto", False, "nllb"
                     elif tl in {"tyv", "tuvinian"}:
-                        beam_v, topk_v, rr_mode, piv_on, piv_backend = 24, 5, "cometqe", False, "nllb"
+                        beam_v, topk_v, rr_mode, piv_on, piv_backend = 24, 5, "auto", False, "nllb"
                     elif tl in {"yakut", "sah", "sakha"}:
-                        beam_v, topk_v, rr_mode, piv_on, piv_backend = 32, 10, "cometqe", True, "nllb"
+                        beam_v, topk_v, rr_mode, piv_on, piv_backend = 32, 10, "auto", False, "nllb"  # RU-pivot default OFF
                     return beam_v, topk_v, rr_mode, piv_on, piv_backend
                 def _apply_presets(t):
                     b, k, rm, piv, pivb = _presets(t)
@@ -875,5 +822,21 @@ def build_ui():
 
 if __name__ == "__main__":
     app = build_ui()
-    app.launch(server_name="127.0.0.1", server_port=7860)
+    
+    # Optional auth via env var GRADIO_AUTH="user:pass"
+    launch_kwargs = {
+        "server_name": "0.0.0.0", 
+        "server_port": 7860
+    }
+    
+    import os
+    auth_env = os.environ.get("GRADIO_AUTH")
+    if auth_env and ":" in auth_env:
+        try:
+            user, password = auth_env.split(":", 1)
+            launch_kwargs["auth"] = (user, password)
+        except Exception:
+            pass  # Ignore malformed auth
+    
+    app.launch(**launch_kwargs)
 
