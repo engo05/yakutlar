@@ -30,11 +30,11 @@
         }
     },
     
-    "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt && chmod +x .devcontainer/start.sh",
+    "postCreateCommand": "python -m pip install --upgrade pip && pip install -r requirements.txt && chmod +x .devcontainer/start.sh || true",
     
     "postStartCommand": "bash .devcontainer/start.sh",
     
-    "remoteEnv": {
+    "containerEnv": {
         "GRADIO_SERVER_NAME": "0.0.0.0"
     }
 }
