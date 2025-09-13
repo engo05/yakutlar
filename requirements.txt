@@ -1,0 +1,12 @@
+# Core dependencies for Yakutlar Turkic Translation App
+gradio>=4.0.0
+ctranslate2>=3.0.0
+transformers>=4.20.0
+
+# Optional dependencies for enhanced functionality
+# Uncomment if you want to use COMET evaluation
+# comet-ml
+# torch>=1.12.0
+
+# Standard libraries (already included in Python)
+# json, os, re are built-in
