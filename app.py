@@ -822,13 +822,12 @@ def build_ui():
 
 if __name__ == "__main__":
     app = build_ui()
-    
-    # Optional auth via env var GRADIO_AUTH="user:pass"
+
     launch_kwargs = {
-        "server_name": "0.0.0.0", 
-        "server_port": 7860
+        "server_name": "0.0.0.0",
+        "server_port": 7860,
     }
-    
+
     import os
     auth_env = os.environ.get("GRADIO_AUTH")
     if auth_env and ":" in auth_env:
@@ -836,7 +835,14 @@ if __name__ == "__main__":
             user, password = auth_env.split(":", 1)
             launch_kwargs["auth"] = (user, password)
         except Exception:
-            pass  # Ignore malformed auth
-    
+            pass
+
+    # NEW: Enable share link in Codespaces or when GRADIO_SHARE is set
+    share_env = os.environ.get("GRADIO_SHARE", "").strip()
+    in_codespaces = bool(os.environ.get("CODESPACES") or os.environ.get("CODESPACE_NAME"))
+    if in_codespaces or share_env in {"1", "true", "True", "yes", "YES"}:
+        launch_kwargs["share"] = True
+
+    print(f"[Yakutlar] Launching with args: {launch_kwargs}")
     app.launch(**launch_kwargs)
 

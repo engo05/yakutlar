@@ -31,7 +31,7 @@ The app supports translation to the following Turkic languages:
 
 The easiest way to run this app is using GitHub Codespaces - perfect for one-tap usage from mobile devices like iPhone:
 
-### Steps:
+### Option A: Use Codespaces Public Port (existing method)
 1. Go to the repository on GitHub
 2. Click **Code** → **Codespaces** → **Create codespace on main**
 3. Wait for the Codespace to load and dependencies to install
@@ -41,13 +41,31 @@ The easiest way to run this app is using GitHub Codespaces - perfect for one-tap
 7. Set visibility to **Public** (click the lock icon)
 8. Click the URL to open the app on your device
 
-### Optional Authentication:
-For secure access, you can set authentication:
+### Option B: Use Gradio Share Link (automatic in Codespaces)
+1. Create a Codespace as above (steps 1-3)
+2. The app will automatically enable Gradio's share tunnel in Codespaces
+3. Check the terminal or `app.log` for the `https://*.gradio.live` URL
+4. Use this URL from any device (iPhone over cellular, etc.)
+
+**Note:** The Gradio share link is automatically enabled in Codespaces and provides a stable external URL that works from anywhere without configuring ports.
+
+### Manual Share Mode
+To enable share mode locally or in other environments:
+```bash
+export GRADIO_SHARE=1
+python app.py
+```
+
+### Authentication
+For secure access, you can set authentication (works with both port forwarding and share mode):
 ```bash
 export GRADIO_AUTH="username:password"
 # Then restart the app
 bash .devcontainer/start.sh
 ```
+
+### Troubleshooting Mobile Access
+If the Public port shows errors on mobile devices (especially iPhone without Wi-Fi), switch to share mode by setting `GRADIO_SHARE=1` or use a Codespace which enables it automatically.
 
 ## Local Installation
 
