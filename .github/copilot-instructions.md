@@ -3,7 +3,9 @@
 Purpose: Help AI coding agents work productively in this repo. Keep changes minimal, focused, and consistent with existing patterns.
 
 ## Architecture
-- Single-file Gradio app: `app.py` builds the UI with two tabs: "Translate" (main) and "Compare".
+- Single-file Gradio app: `app.py` builds the UI with two tabs:
+  - "Translate" (main): Full-featured translation with all options
+  - "Compare": Side-by-side comparison of MADLAD vs NLLB backends
 - Translation backends via CTranslate2:
   - MADLAD/T5 (`T5_MODEL_DIR`, `T5_TOKENIZER_DIR`) with language tags like `<2sah>`
   - NLLB (`NLLB_MODEL_DIR`, `NLLB_HF_MODEL`) using `target_prefix` lang ids (e.g., `kaz_Cyrl`)
@@ -24,11 +26,13 @@ Purpose: Help AI coding agents work productively in this repo. Keep changes mini
 - Codespaces/mobile friendly:
   - App auto-enables Gradio share in Codespaces or when `GRADIO_SHARE=1`
   - Optional basic auth via `GRADIO_AUTH="user:pass"`
+  - Use `bash .devcontainer/start.sh` to start in background with logging
 - Model availability:
   - Place CT2 models/tokenizers under `models/` matching defaults:
     - `models/nllb200-1.3b-ct2-int8`, `facebook/nllb-200-distilled-600M`
     - `models/madlad400-3b-mt-ct2-int8`, `models/madlad400-3b-mt`
     - Optional Marian: `models/opus-mt-en-mul-ct2-int8`, `models/opus-mt-en-mul`
+- Testing without models: App will import successfully but backend calls will fail gracefully with error messages
 
 ## Conventions & Patterns
 - Inputs/Outputs: Core translate fn returns `(out_text, translit, alternatives)` strings; always keep triple.
@@ -38,7 +42,7 @@ Purpose: Help AI coding agents work productively in this repo. Keep changes mini
   - Chuvash forces Marian for single-word edge cases; also global early Marian path if tag is supported.
 - Reranking:
   - `rerank_mode` supports `auto|none|roundtrip|cometqe`.
-  - Auto: short (≤2 words) → none; long → COMET-QE if loadable else roundtrip; medium → roundtrip.
+  - Auto: short (≤2 words) → none; medium (3-4 words or <20 chars) → roundtrip; long (≥5 words or ≥20 chars) → COMET-QE if loadable else roundtrip.
 - Decoding knobs per target: `get_defaults_for_target` and `get_flag_defaults_for_target` feed UI defaults per `target` change.
 - Script conformity: `_prefer_cyrillic_hyps` stable-reorders to prefer non-ASCII for Cyrillic targets.
 - Cleanup: `strip_ascii_tail` applied by default to Cyrillic targets or when user sets checkbox.
@@ -49,11 +53,21 @@ Purpose: Help AI coding agents work productively in this repo. Keep changes mini
 - COMET-QE: set `comet_model` (default `Unbabel/wmt22-cometkiwi-da`). Requires installing comet + torch if actually used.
 - Two-stage pivot: optional EN→RU (NLLB) n-best to target (T5) with reranking.
 - Roundtrip scoring backend can be T5 or Marian big models (`rt_marian_*`).
+- Dictionary overrides: JSON file with target language aliases as keys, e.g.:
+  ```json
+  {
+    "chuvash": {"hello": "салам", "world": "тӗнче"},
+    "cv": {"hello": "салам"},
+    "yakut": {"fire": "уот"},
+    "sakha": {"fire": "уот"}
+  }
+  ```
 
 ## Making Changes Safely
 - Keep API stable: do not change Gradio component signatures or return shapes.
 - Avoid renaming constants/keys used across the UI (e.g., `ALL_TARGETS`, `T5_TURKIC` keys).
 - Preserve caches and model-loading patterns (`_load_*`) to avoid repeated downloads.
+- Main translate function always returns `(output_text, transliteration, alternatives)` tuple.
 - When adding a new language:
   - Add to the appropriate map(s): `T5_TURKIC` and/or `NLLB_TURKIC` with correct tag/id.
   - If Cyrillic-heavy, consider adding to `CYRILLIC_STRIP_DEFAULT`.
