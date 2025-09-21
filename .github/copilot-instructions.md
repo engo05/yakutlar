@@ -18,6 +18,7 @@ Purpose: Help AI coding agents work productively in this repo. Keep changes mini
 - `requirements.txt`: Minimal deps. Optional COMET/Torch commented out.
 - `models/`: Expected local folders for CT2 models (not in repo). See constants at top of `app.py`.
 - `overrides.json`: Optional local file for dictionary overrides (keyed by target).
+- `overrides.json.example`: Sample dictionary override structure for reference.
 
 ## Developer Workflows
 - Run locally:
@@ -53,7 +54,7 @@ Purpose: Help AI coding agents work productively in this repo. Keep changes mini
 - COMET-QE: set `comet_model` (default `Unbabel/wmt22-cometkiwi-da`). Requires installing comet + torch if actually used.
 - Two-stage pivot: optional EN→RU (NLLB) n-best to target (T5) with reranking.
 - Roundtrip scoring backend can be T5 or Marian big models (`rt_marian_*`).
-- Dictionary overrides: JSON file with target language aliases as keys, e.g.:
+- Dictionary overrides: JSON file with target language aliases as keys (see `overrides.json.example`):
   ```json
   {
     "chuvash": {"hello": "салам", "world": "тӗнче"},
